@@ -1,0 +1,27 @@
+{
+  "_comment": "ApexPilot Splunk exporter config. 'hec' block is only used with --mode hec/both. Default (file mode) needs nothing here and is fully offline.",
+  "all": false,
+  "whitelist": [
+    "carState",
+    "carControl",
+    "controlsState",
+    "selfdriveState",
+    "liveParameters",
+    "deviceState",
+    "driverMonitoringState",
+    "driverStateV2",
+    "onroadEvents",
+    "gpsLocationExternal",
+    "liveLocationKalman",
+    "peripheralState",
+    "pandaStates",
+    "managerState",
+    "errorLogMessage"
+  ],
+  "hec": {
+    "url": "https://splunk.example.internal:8088",
+    "token": "REPLACE_WITH_HEC_TOKEN",
+    "index": "apexpilot",
+    "no_verify_tls": false
+  }
+}
