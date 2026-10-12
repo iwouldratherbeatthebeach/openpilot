@@ -31,7 +31,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DisableDriverCameraIR", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"DisableLogging", {CLEAR_ON_MANAGER_START | CLEAR_ON_ONROAD_TRANSITION, BOOL}},
     {"DisablePowerDown", {PERSISTENT | BACKUP, BOOL}},
-    {"DisableUpdates", {PERSISTENT | BACKUP, BOOL, "0"}},
+    {"DisableUpdates", {PERSISTENT | BACKUP, BOOL, "1"}},
     {"DisengageOnAccelerator", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"DongleId", {PERSISTENT, STRING}},
     {"DoReboot", {CLEAR_ON_MANAGER_START, BOOL}},
@@ -113,7 +113,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"PandaHeartbeatLost", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL}},
     {"PrimeType", {PERSISTENT, INT}},
     {"RecordAudio", {PERSISTENT | BACKUP, BOOL}},
-    {"RecordFront", {PERSISTENT | BACKUP, BOOL}},
+    {"RecordFront", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"RecordFrontLock", {PERSISTENT, BOOL}},  // for the internal fleet
     {"SecOCKey", {PERSISTENT | DONT_LOG | BACKUP, STRING}},
     {"ShowDebugInfo", {PERSISTENT, BOOL}},
@@ -181,7 +181,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"OnroadScreenOffBrightnessMigrated", {PERSISTENT | BACKUP, STRING, "0.0"}},
     {"OnroadScreenOffTimer", {PERSISTENT | BACKUP, INT, "15"}},
     {"OnroadScreenOffTimerMigrated", {PERSISTENT | BACKUP, STRING, "0.0"}},
-    {"OnroadUploads", {PERSISTENT | BACKUP, BOOL, "1"}},
+    {"OnroadUploads", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"QuickBootToggle", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"QuietMode", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"RainbowMode", {PERSISTENT | BACKUP, BOOL, "0"}},
@@ -217,14 +217,14 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"NeuralNetworkLateralControl", {PERSISTENT | BACKUP, BOOL, "0"}},
 
     // sunnylink params
-    {"EnableSunnylinkUploader", {PERSISTENT | BACKUP, BOOL}},
+    {"EnableSunnylinkUploader", {PERSISTENT | BACKUP, BOOL, "0"}},
     {"LastSunnylinkPingTime", {CLEAR_ON_MANAGER_START, INT}},
     {"ParamsVersion", {PERSISTENT, INT}},
     {"SunnylinkCache_Roles", {PERSISTENT, STRING}},
     {"SunnylinkCache_Users", {PERSISTENT, STRING}},
     {"SunnylinkDongleId", {PERSISTENT, STRING}},
     {"SunnylinkdPid", {PERSISTENT, INT}},
-    {"SunnylinkEnabled", {PERSISTENT, BOOL, "1"}},
+    {"SunnylinkEnabled", {PERSISTENT, BOOL, "0"}},
     {"SunnylinkTempFault", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL, "0"}},
 
     // Backup Manager params
