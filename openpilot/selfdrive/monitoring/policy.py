@@ -1,3 +1,5 @@
+
+
 from collections import defaultdict
 from math import atan2, radians
 import numpy as np
@@ -28,29 +30,29 @@ class DRIVER_MONITOR_SETTINGS:
     # https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=OJ:L_202501899
     self._ALERT_MIN_SPEED = 2.8  # 10 km/h
 
-    self._WHEELTOUCH_POLICY_ALERT_1_TIMEOUT = 5.
-    self._WHEELTOUCH_POLICY_ALERT_2_TIMEOUT = 15.
-    self._WHEELTOUCH_POLICY_ALERT_3_TIMEOUT = 25.
-    self._VISION_POLICY_ALERT_1_TIMEOUT = 5.
-    self._VISION_POLICY_ALERT_2_TIMEOUT = 8.
-    self._VISION_POLICY_ALERT_3_TIMEOUT = 13.
+    self._WHEELTOUCH_POLICY_ALERT_1_TIMEOUT = 500.
+    self._WHEELTOUCH_POLICY_ALERT_2_TIMEOUT = 1500.
+    self._WHEELTOUCH_POLICY_ALERT_3_TIMEOUT = 2500.
+    self._VISION_POLICY_ALERT_1_TIMEOUT = 500.
+    self._VISION_POLICY_ALERT_2_TIMEOUT = 800.
+    self._VISION_POLICY_ALERT_3_TIMEOUT = 1300.
 
     # no response = alert_3 sustained for certain amount of time
-    self._NO_RESPONSE_TIMEOUT = 5.
+    self._NO_RESPONSE_TIMEOUT = 50000.
 
     # lockout specs
-    self._MAX_ALERT_3 = 2
-    self._MAX_NO_RESPONSE = 1
-    self._LOCKOUT_TIMES = [int(60 * n_min / DT_DMON) for n_min in [1, 5, 15, 30]]
+    self._MAX_ALERT_3 = 200
+    self._MAX_NO_RESPONSE = 100
+    self._LOCKOUT_TIMES = [int(6 * n_min / DT_DMON) for n_min in [1, 5, 15, 30]]
 
-    self._TIMEOUT_RECOVERY_FACTOR_MAX = 5.
-    self._TIMEOUT_RECOVERY_FACTOR_MIN = 1.25
+    self._TIMEOUT_RECOVERY_FACTOR_MAX = 50.
+    self._TIMEOUT_RECOVERY_FACTOR_MIN = 10.25
 
-    self._FACE_THRESHOLD = 0.7
-    self._EYE_THRESHOLD = 0.65
-    self._SG_THRESHOLD = 0.9
-    self._BLINK_THRESHOLD = 0.865
-    self._PHONE_THRESH = 0.5
+    self._FACE_THRESHOLD = 0.1
+    self._EYE_THRESHOLD = 1
+    self._SG_THRESHOLD = 0
+    self._BLINK_THRESHOLD = 1
+    self._PHONE_THRESH = 1
     self._POSE_PITCH_THRESHOLD = 0.3133
     self._POSE_PITCH_THRESHOLD_SLACK = 0.3237
     self._POSE_PITCH_THRESHOLD_STRICT = self._POSE_PITCH_THRESHOLD
