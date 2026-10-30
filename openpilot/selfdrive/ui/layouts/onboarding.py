@@ -177,7 +177,7 @@ class OnboardingWindow(Widget):
   def __init__(self):
     super().__init__()
     self._accepted_terms: bool = ui_state.params.get("HasAcceptedTerms") == terms_version
-    self._training_done: bool = ui_state.params.get("CompletedTrainingVersion") == training_version
+    self._training_done: bool = True
 
     self._state = OnboardingState.TERMS if not self._accepted_terms else OnboardingState.ONBOARDING
 
