@@ -1,244 +1,473 @@
-import os
-import re
-import threading
-from enum import IntEnum
+from collections import defaultdict
+from math import atan2, radians
+import numpy as np
 
-import pyray as rl
-from openpilot.common.basedir import BASEDIR
-from openpilot.system.ui.lib.application import FontWeight, TextAlignment, gui_app
-from openpilot.system.ui.lib.multilang import tr
-from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.button import Button, ButtonStyle
-from openpilot.system.ui.widgets.label import Label
-from openpilot.selfdrive.ui.ui_state import ui_state
-from openpilot.common.version import terms_version, training_version, terms_version_sp
+from openpilot.cereal import log
+from opendbc.car.structs import car
+import openpilot.cereal.messaging as messaging
+from openpilot.common.realtime import DT_DMON
+from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.params import Params
+from openpilot.common.stat_live import RunningStatFilter
+from openpilot.common.transformations.camera import DEVICE_CAMERAS
 
-from openpilot.selfdrive.ui.sunnypilot.layouts.onboarding import SunnylinkOnboarding
+AlertLevel = log.DriverMonitoringState.AlertLevel
+MonitoringPolicy = log.DriverMonitoringState.MonitoringPolicy
 
-DEBUG = False
+def to_percent(v):
+  return int(min(max(v * 100., 0.), 100.))
 
-STEP_RECTS = [rl.Rectangle(104, 800, 633, 175), rl.Rectangle(1835, 0, 2159, 1080), rl.Rectangle(1835, 0, 2156, 1080),
-              rl.Rectangle(1526, 473, 427, 472), rl.Rectangle(1643, 441, 217, 223), rl.Rectangle(1835, 0, 2155, 1080),
-              rl.Rectangle(1786, 591, 267, 236), rl.Rectangle(1353, 0, 804, 1080), rl.Rectangle(1458, 485, 633, 211),
-              rl.Rectangle(95, 794, 1158, 187), rl.Rectangle(1560, 170, 392, 397), rl.Rectangle(1835, 0, 2159, 1080),
-              rl.Rectangle(1351, 0, 807, 1080), rl.Rectangle(1835, 0, 2158, 1080), rl.Rectangle(1531, 82, 441, 920),
-              rl.Rectangle(1336, 438, 490, 393), rl.Rectangle(1835, 0, 2159, 1080), rl.Rectangle(1835, 0, 2159, 1080),
-              rl.Rectangle(87, 795, 1187, 186)]
+# ******************************************************************************************
+#  NOTE: To fork maintainers.
+#  Disabling or nerfing safety features will get you and your users banned from our servers.
+#  We recommend that you do not change these numbers from the defaults.
+# ******************************************************************************************
 
-DM_RECORD_STEP = 9
-DM_RECORD_YES_RECT = rl.Rectangle(695, 794, 558, 187)
-
-RESTART_TRAINING_RECT = rl.Rectangle(87, 795, 472, 186)
-
-
-class OnboardingState(IntEnum):
-  TERMS = 0
-  ONBOARDING = 1
-  DECLINE = 2
-  SUNNYLINK_CONSENT = 3
-
-
-class TrainingGuide(Widget):
-  def __init__(self, completed_callback=None):
-    super().__init__()
-    self._completed_callback = completed_callback
-
-    self._step = 0
-    self._load_image_paths()
-
-    # Load first image now so we show something immediately
-    self._textures = [gui_app.texture(self._image_paths[0])]
-    self._image_objs = []
-
-    threading.Thread(target=self._preload_thread, daemon=True).start()
-
-  def _load_image_paths(self):
-    paths = [fn for fn in os.listdir(os.path.join(BASEDIR, "openpilot/selfdrive/assets/training")) if re.match(r'^step\d*\.png$', fn)]
-    paths = sorted(paths, key=lambda x: int(re.search(r'\d+', x).group()))
-    self._image_paths = [os.path.join(BASEDIR, "openpilot/selfdrive/assets/training", fn) for fn in paths]
-
-  def _preload_thread(self):
-    # PNG loading is slow in raylib, so we preload in a thread and upload to GPU in main thread
-    # We've already loaded the first image on init
-    for path in self._image_paths[1:]:
-      self._image_objs.append(gui_app._load_image_from_path(path))
-
-  def _handle_mouse_release(self, mouse_pos):
-    if rl.check_collision_point_rec(mouse_pos, STEP_RECTS[self._step]):
-      # Record DM camera?
-      if self._step == DM_RECORD_STEP:
-        yes = rl.check_collision_point_rec(mouse_pos, DM_RECORD_YES_RECT)
-        print(f"putting RecordFront to {yes}")
-        ui_state.params.put_bool("RecordFront", yes, block=True)
-
-      # Restart training?
-      elif self._step == len(self._image_paths) - 1:
-        if rl.check_collision_point_rec(mouse_pos, RESTART_TRAINING_RECT):
-          self._step = -1
-
-      self._step += 1
-
-      # Finished?
-      if self._step >= len(self._image_paths):
-        self._step = 0
-        if self._completed_callback:
-          self._completed_callback()
-
-        # NOTE: this pops OnboardingWindow during real onboarding
-        gui_app.pop_widget()
-
-  def _update_state(self):
-    if len(self._image_objs):
-      self._textures.append(gui_app._load_texture_from_image(self._image_objs.pop(0)))
-
-  def _render(self, _):
-    # Safeguard against fast tapping
-    step = min(self._step, len(self._textures) - 1)
-    rl.draw_texture_ex(self._textures[step], rl.Vector2(0, 0), 0.0, 1.0, rl.WHITE)
-
-    # progress bar
-    if 0 < step < len(STEP_RECTS) - 1:
-      h = 20
-      w = int((step / (len(STEP_RECTS) - 1)) * self._rect.width)
-      rl.draw_rectangle(int(self._rect.x), int(self._rect.y + self._rect.height - h),
-                        w, h, rl.Color(70, 91, 234, 255))
-
-    if DEBUG:
-      rl.draw_rectangle_lines_ex(STEP_RECTS[step], 3, rl.RED)
-
-    return -1
-
-
-class TermsPage(Widget):
-  def __init__(self, on_accept=None, on_decline=None):
-    super().__init__()
-    self._on_accept = on_accept
-    self._on_decline = on_decline
-
-    self._title = Label(tr("Welcome to sunnypilot"), font_size=90, font_weight=FontWeight.BOLD, text_alignment=TextAlignment.LEFT)
-    self._desc = Label(tr("You must accept the Terms of Service to use sunnypilot. Read the latest terms at https://sunnypilot.ai/terms before continuing."),
-                       font_size=90, font_weight=FontWeight.MEDIUM, text_alignment=TextAlignment.LEFT)
-
-    self._decline_btn = Button(tr("Decline"), click_callback=on_decline)
-    self._accept_btn = Button(tr("Agree"), button_style=ButtonStyle.PRIMARY, click_callback=on_accept)
-
-  def _render(self, _):
-    welcome_x = self._rect.x + 95
-    welcome_y = self._rect.y + 165
-    welcome_rect = rl.Rectangle(welcome_x, welcome_y, self._rect.width - welcome_x, 90)
-    self._title.render(welcome_rect)
-
-    desc_x = welcome_x
-    # TODO: Label doesn't top align when wrapping
-    desc_y = welcome_y - 100
-    desc_rect = rl.Rectangle(desc_x, desc_y, self._rect.width - desc_x, self._rect.height - desc_y - 250)
-    self._desc.render(desc_rect)
-
-    btn_y = self._rect.y + self._rect.height - 160 - 45
-    btn_width = (self._rect.width - 45 * 3) / 2
-    self._decline_btn.render(rl.Rectangle(self._rect.x + 45, btn_y, btn_width, 160))
-    self._accept_btn.render(rl.Rectangle(self._rect.x + 45 * 2 + btn_width, btn_y, btn_width, 160))
-
-    if DEBUG:
-      rl.draw_rectangle_lines_ex(welcome_rect, 3, rl.RED)
-      rl.draw_rectangle_lines_ex(desc_rect, 3, rl.RED)
-
-    return -1
-
-
-class DeclinePage(Widget):
-  def __init__(self, back_callback=None):
-    super().__init__()
-    self._text = Label(tr("You must accept the Terms of Service in order to use sunnypilot."),
-                       font_size=90, font_weight=FontWeight.MEDIUM, text_alignment=TextAlignment.LEFT)
-    self._back_btn = Button(tr("Back"), click_callback=back_callback)
-    self._uninstall_btn = Button(tr("Decline, uninstall sunnypilot"), button_style=ButtonStyle.DANGER,
-                                 click_callback=self._on_uninstall_clicked)
-
-  def _on_uninstall_clicked(self):
-    ui_state.params.put_bool("DoUninstall", True, block=True)
-    gui_app.request_close()
-
-  def _render(self, _):
-    btn_y = self._rect.y + self._rect.height - 160 - 45
-    btn_width = (self._rect.width - 45 * 3) / 2
-    self._back_btn.render(rl.Rectangle(self._rect.x + 45, btn_y, btn_width, 160))
-    self._uninstall_btn.render(rl.Rectangle(self._rect.x + 45 * 2 + btn_width, btn_y, btn_width, 160))
-
-    # text rect in middle of top and button
-    text_height = btn_y - (200 + 45)
-    text_rect = rl.Rectangle(self._rect.x + 165, self._rect.y + (btn_y - text_height) / 2 + 10, self._rect.width - (165 * 2), text_height)
-    if DEBUG:
-      rl.draw_rectangle_lines_ex(text_rect, 3, rl.RED)
-    self._text.render(text_rect)
-
-
-class OnboardingWindow(Widget):
+class DRIVER_MONITOR_SETTINGS:
   def __init__(self):
-    super().__init__()
-    self._accepted_terms: bool = ui_state.params.get("HasAcceptedTerms") == terms_version
-    self._training_done: bool = True
+    # https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=OJ:L_202501899
+    self._ALERT_MIN_SPEED = 2.8  # 10 km/h
 
-    self._state = OnboardingState.TERMS if not self._accepted_terms else OnboardingState.ONBOARDING
+    self._WHEELTOUCH_POLICY_ALERT_1_TIMEOUT = 55.
+    self._WHEELTOUCH_POLICY_ALERT_2_TIMEOUT = 515.
+    self._WHEELTOUCH_POLICY_ALERT_3_TIMEOUT = 525.
+    self._VISION_POLICY_ALERT_1_TIMEOUT = 55.
+    self._VISION_POLICY_ALERT_2_TIMEOUT = 58.
+    self._VISION_POLICY_ALERT_3_TIMEOUT = 153.
 
-    # Windows
-    self._terms = TermsPage(on_accept=self._on_terms_accepted, on_decline=self._on_terms_declined)
-    self._training_guide: TrainingGuide | None = None
-    self._decline_page = DeclinePage(back_callback=self._on_decline_back)
+    # no response = alert_3 sustained for certain amount of time
+    self._NO_RESPONSE_TIMEOUT = 65.
 
-    # sunnylink consent pages
-    self._accepted_terms = self._accepted_terms and ui_state.params.get("HasAcceptedTermsSP") == terms_version_sp
-    self._sunnylink = SunnylinkOnboarding()
-    if not self._accepted_terms:
-      self._state = OnboardingState.TERMS
-    elif not self._sunnylink.completed:
-      self._state = OnboardingState.SUNNYLINK_CONSENT
-    elif not self._training_done:
-      self._state = OnboardingState.ONBOARDING
-    else:
-      self._state = OnboardingState.ONBOARDING
+    # lockout specs
+    self._MAX_ALERT_3 = 2
+    self._MAX_NO_RESPONSE = 1
+    self._LOCKOUT_TIMES = [int(60 * n_min / DT_DMON) for n_min in [1, 5, 15, 30]]
 
-  @property
-  def completed(self) -> bool:
-    return self._accepted_terms and self._sunnylink.completed and self._training_done
+    self._TIMEOUT_RECOVERY_FACTOR_MAX = 5.
+    self._TIMEOUT_RECOVERY_FACTOR_MIN = 1.25
 
-  def _on_terms_declined(self):
-    self._state = OnboardingState.DECLINE
+    self._FACE_THRESHOLD = 0.1
+    self._EYE_THRESHOLD = 0.1
+    self._SG_THRESHOLD = 0.9
+    self._BLINK_THRESHOLD = 1
+    self._PHONE_THRESH = 0.1
+    self._SLEEP_THRESH = 1
+    self._POSE_PITCH_THRESHOLD = 0.3133
+    self._POSE_PITCH_THRESHOLD_SLACK = 0.3237
+    self._POSE_PITCH_THRESHOLD_STRICT = self._POSE_PITCH_THRESHOLD
+    self._POSE_YAW_THRESHOLD = 0.4020
+    self._POSE_YAW_THRESHOLD_SLACK = 0.5042
+    self._POSE_YAW_THRESHOLD_STRICT = self._POSE_YAW_THRESHOLD
+    self._POSE_YAW_MIN_STEER_DEG = 30
+    self._POSE_YAW_STEER_FACTOR = 0.15
+    self._POSE_YAW_STEER_MAX_OFFSET = 0.3927
+    self._PITCH_NATURAL_OFFSET = 0.011 # initial value before offset is learned
+    self._PITCH_NATURAL_THRESHOLD = 0.449
+    self._YAW_NATURAL_OFFSET = 0.075 # initial value before offset is learned
+    self._PITCH_NATURAL_VAR = 3*0.01
+    self._YAW_NATURAL_VAR = 3*0.05
+    self._PITCH_MAX_OFFSET = 0.124
+    self._PITCH_MIN_OFFSET = -0.0881
+    self._YAW_MAX_OFFSET = 0.289
+    self._YAW_MIN_OFFSET = -0.0246
 
-  def _on_decline_back(self):
-    self._state = OnboardingState.TERMS
+    self._DCAM_UNCERTAIN_ALERT_THRESHOLD = 0.1
+    self._DCAM_UNCERTAIN_ALERT_COUNT = int(60  / DT_DMON)
+    self._DCAM_UNCERTAIN_RESET_COUNT = int(2  / DT_DMON)
+    self._HI_STD_THRESHOLD = 0.3
+    self._HI_STD_FALLBACK_TIME = int(10  / DT_DMON)  # fall back to wheel touch if model is uncertain for 10s
+    self._DISTRACTED_FILTER_TS = 0.25  # 0.6Hz
 
-  def _on_terms_accepted(self):
-    ui_state.params.put("HasAcceptedTerms", terms_version, block=True)
-    ui_state.params.put("HasAcceptedTermsSP", terms_version_sp, block=True)
-    if not self._sunnylink.completed:
-      self._state = OnboardingState.SUNNYLINK_CONSENT
-    elif not self._training_done:
-      self._state = OnboardingState.ONBOARDING
-    else:
-      gui_app.pop_widget()
+    self._POSE_CALIB_MIN_SPEED = 13  # 30 mph
+    self._POSE_OFFSET_MIN_COUNT = int(60 / DT_DMON)  # valid data counts before calibration completes, 1min cumulative
+    self._POSE_OFFSET_MAX_COUNT = int(360 / DT_DMON)  # stop deweighting new data after 6 min, aka "short term memory"
+    self._WHEELPOS_CALIB_MIN_SPEED = 11
+    self._WHEELPOS_THRESHOLD = 0.5
+    self._WHEELPOS_FILTER_MIN_COUNT = int(15 / DT_DMON) # allow 15 seconds to converge wheel side
+    self._WHEELPOS_DATA_AVG = 0.03
+    self._WHEELPOS_DATA_VAR = 3*5.5e-5
+    self._WHEELPOS_MAX_COUNT = -1
 
-  def _on_completed_training(self):
-    ui_state.params.put("CompletedTrainingVersion", training_version, block=True)
+class DriverPose:
+  def __init__(self, settings):
+    pitch_filter_raw_priors = (settings._PITCH_NATURAL_OFFSET, settings._PITCH_NATURAL_VAR, 2)
+    yaw_filter_raw_priors = (settings._YAW_NATURAL_OFFSET, settings._YAW_NATURAL_VAR, 2)
+    self.yaw = 0.
+    self.pitch = 0.
+    self.pitch_offsetter = RunningStatFilter(raw_priors=pitch_filter_raw_priors, max_trackable=settings._POSE_OFFSET_MAX_COUNT)
+    self.yaw_offsetter = RunningStatFilter(raw_priors=yaw_filter_raw_priors, max_trackable=settings._POSE_OFFSET_MAX_COUNT)
+    self.calibrated = False
+    self.low_std = True
+    self.cfactor_pitch = 1.
+    self.cfactor_yaw = 1.
+    self.steer_yaw_offset = 0.
 
-  def _render(self, _):
-    if self._training_guide is None:
-      self._training_guide = TrainingGuide(completed_callback=self._on_completed_training)
+class DriverBlink:
+  def __init__(self):
+    self.left = 0.
+    self.right = 0.
 
-    if self._state == OnboardingState.TERMS:
-      self._terms.render(self._rect)
-    elif self._state == OnboardingState.SUNNYLINK_CONSENT:
-      self._sunnylink.render(self._rect)
-      if self._sunnylink.completed:
-        if not self._training_done:
-          self._state = OnboardingState.ONBOARDING
-        else:
-          gui_app.pop_widget()
-    elif self._state == OnboardingState.ONBOARDING:
-      if not self._training_done:
-        self._training_guide.render(self._rect)
+# model output refers to center of undistorted+leveled image
+ref_undistorted_cam = DEVICE_CAMERAS[("tici", "ar0231")].cabin
+cabin_undistorted_FL = 598.0
+cabin_undistorted_W, cabin_undistorted_H = (ref_undistorted_cam.width, ref_undistorted_cam.height)
+
+def face_orientation_from_model(orient_model, pos_model, rpy_calib):
+  pitch_model = orient_model[0]
+  yaw_model = orient_model[1]
+
+  face_pixel_position = ((pos_model[0]+0.5)*cabin_undistorted_W, (pos_model[1]+0.5)*cabin_undistorted_H)
+  yaw_focal_angle = atan2(face_pixel_position[0] - cabin_undistorted_W//2, cabin_undistorted_FL)
+  pitch_focal_angle = atan2(face_pixel_position[1] - cabin_undistorted_H//2, cabin_undistorted_FL)
+
+  pitch = pitch_model + pitch_focal_angle
+  yaw = -yaw_model + yaw_focal_angle
+
+  pitch -= rpy_calib[1]
+  yaw -= rpy_calib[2]
+  return pitch, yaw
+
+
+class DriverMonitoring:
+  def __init__(self, rhd_saved=False, settings=None, always_on=False):
+    # init policy settings
+    self.settings = settings if settings is not None else DRIVER_MONITOR_SETTINGS()
+
+    # init driver status
+    wheelpos_filter_raw_priors = (self.settings._WHEELPOS_DATA_AVG, self.settings._WHEELPOS_DATA_VAR, 2)
+    self.wheelpos_offsetter = RunningStatFilter(raw_priors=wheelpos_filter_raw_priors, max_trackable=self.settings._WHEELPOS_MAX_COUNT)
+    self.pose = DriverPose(settings=self.settings)
+    self.blink = DriverBlink()
+    self.phone_prob = 0.
+    self.sleep_prob = 0.
+
+    self.alert_level = AlertLevel.none
+    self.always_on = always_on
+    self.distracted_types = defaultdict(bool)
+    self.driver_distracted = False
+    self.driver_distraction_filter = FirstOrderFilter(0., self.settings._DISTRACTED_FILTER_TS, DT_DMON)
+    self.wheel_on_right = False
+    self.wheel_on_right_last = None
+    self.wheel_on_right_default = rhd_saved
+    self.face_detected = False
+    self.alert_3_cnt = 0
+    self.cnt_since_alert_3 = 0
+    self.no_response_timeout = int(self.settings._NO_RESPONSE_TIMEOUT / DT_DMON)
+    self.no_response_cnt = 0
+    self.lockout_active = Params().get_bool("DriverTooDistracted")
+    self.lockout_count = Params().get("DriverLockoutCount") or 0
+    self.lockout_duration = self.settings._LOCKOUT_TIMES[min(max(self.lockout_count - 1, 0), len(self.settings._LOCKOUT_TIMES) - 1)]
+    self.lockout_time_elapsed = 0
+    self.step_change = 0.
+    self.active_policy = MonitoringPolicy.vision
+    self.driver_interacting = False
+    self.is_model_uncertain = False
+    self.hi_stds = 0
+    self.model_std_max = 0.
+    self.threshold_alert_1 = 0.
+    self.threshold_alert_2 = 0.
+    self.dcam_uncertain_cnt = 0
+    self.dcam_reset_cnt = 0
+
+    self._reset_awareness()
+    self._set_policy(MonitoringPolicy.vision)
+
+  def _reset_awareness(self):
+    self.awareness = 1.
+    self.last_vision_awareness = 1.
+    self.last_wheeltouch_awareness = 1.
+
+  def _set_policy(self, target_policy):
+    if self.active_policy == MonitoringPolicy.vision and self.awareness <= self.threshold_alert_2:
+      if target_policy == MonitoringPolicy.vision:
+        self.step_change = DT_DMON / self.settings._VISION_POLICY_ALERT_3_TIMEOUT
       else:
-        gui_app.pop_widget()
-    elif self._state == OnboardingState.DECLINE:
-      self._decline_page.render(self._rect)
-    return -1
+        self.step_change = 0.
+      return  # no exploit after orange alert
+    elif self.awareness <= 0.:
+      return
+
+    if target_policy == MonitoringPolicy.vision:
+      # when falling back from passive mode to active mode, reset awareness to avoid false alert
+      if self.active_policy != MonitoringPolicy.vision:
+        self.last_wheeltouch_awareness = self.awareness
+        self.awareness = self.last_vision_awareness
+
+      self.threshold_alert_1 = 1. - self.settings._VISION_POLICY_ALERT_1_TIMEOUT / self.settings._VISION_POLICY_ALERT_3_TIMEOUT
+      self.threshold_alert_2 = 1. - self.settings._VISION_POLICY_ALERT_2_TIMEOUT / self.settings._VISION_POLICY_ALERT_3_TIMEOUT
+      self.step_change = DT_DMON / self.settings._VISION_POLICY_ALERT_3_TIMEOUT
+      self.active_policy = MonitoringPolicy.vision
+    else:
+      if self.active_policy == MonitoringPolicy.vision:
+        self.last_vision_awareness = self.awareness
+        self.awareness = self.last_wheeltouch_awareness
+
+      self.threshold_alert_1 = 1. - self.settings._WHEELTOUCH_POLICY_ALERT_1_TIMEOUT / self.settings._WHEELTOUCH_POLICY_ALERT_3_TIMEOUT
+      self.threshold_alert_2 = 1. - self.settings._WHEELTOUCH_POLICY_ALERT_2_TIMEOUT / self.settings._WHEELTOUCH_POLICY_ALERT_3_TIMEOUT
+      self.step_change = DT_DMON / self.settings._WHEELTOUCH_POLICY_ALERT_3_TIMEOUT
+      self.active_policy = MonitoringPolicy.wheeltouch
+
+  def _set_pose_strictness(self, brake_disengage_prob, car_speed):
+    bp = brake_disengage_prob
+    k1 = max(-0.00156*((car_speed-16)**2)+0.6, 0.2)
+    bp_normal = max(min(bp / k1, 0.5),0)
+    self.pose.cfactor_pitch = np.interp(bp_normal, [0, 0.5],
+                                           [self.settings._POSE_PITCH_THRESHOLD_SLACK,
+                                            self.settings._POSE_PITCH_THRESHOLD_STRICT]) / self.settings._POSE_PITCH_THRESHOLD
+    self.pose.cfactor_yaw = np.interp(bp_normal, [0, 0.5],
+                                           [self.settings._POSE_YAW_THRESHOLD_SLACK,
+                                            self.settings._POSE_YAW_THRESHOLD_STRICT]) / self.settings._POSE_YAW_THRESHOLD
+
+  def _get_distracted_types(self):
+    self.distracted_types = defaultdict(bool)
+
+    if not self.pose.calibrated:
+      pitch_error = self.pose.pitch - self.settings._PITCH_NATURAL_OFFSET
+      yaw_error = self.pose.yaw - self.settings._YAW_NATURAL_OFFSET
+    else:
+      pitch_error = self.pose.pitch - min(max(self.pose.pitch_offsetter.filtered_stat.mean(),
+                                                       self.settings._PITCH_MIN_OFFSET), self.settings._PITCH_MAX_OFFSET)
+      yaw_error = self.pose.yaw - min(max(self.pose.yaw_offsetter.filtered_stat.mean(),
+                                                    self.settings._YAW_MIN_OFFSET), self.settings._YAW_MAX_OFFSET)
+    pitch_error = 0 if pitch_error > 0 else abs(pitch_error) # no positive pitch limit
+
+    if yaw_error * self.pose.steer_yaw_offset > 0: # unidirectional
+      yaw_error = max(abs(yaw_error) - min(abs(self.pose.steer_yaw_offset), self.settings._POSE_YAW_STEER_MAX_OFFSET), 0.)
+    else:
+      yaw_error = abs(yaw_error)
+
+    pitch_threshold = self.settings._POSE_PITCH_THRESHOLD * self.pose.cfactor_pitch if self.pose.calibrated else self.settings._PITCH_NATURAL_THRESHOLD
+    yaw_threshold = self.settings._POSE_YAW_THRESHOLD * self.pose.cfactor_yaw
+
+    self.distracted_types['pose'] = bool((pitch_error > pitch_threshold) or (yaw_error > yaw_threshold))
+    self.distracted_types['eye'] = bool((self.blink.left + self.blink.right)*0.5 > self.settings._BLINK_THRESHOLD)
+    self.distracted_types['phone'] = bool(self.phone_prob > self.settings._PHONE_THRESH)
+    self.distracted_types['sleep'] = bool(self.sleep_prob > self.settings._SLEEP_THRESH)
+
+  def _update_states(self, driver_state, cal_rpy, car_speed, op_engaged, lowspeed, demo_mode=False, steering_angle_deg=0.):
+    rhd_pred = driver_state.wheelOnRightProb
+    # calibrates only when there's movement and either face detected
+    if car_speed > self.settings._WHEELPOS_CALIB_MIN_SPEED and (driver_state.leftDriverData.faceProb > self.settings._FACE_THRESHOLD or
+                                          driver_state.rightDriverData.faceProb > self.settings._FACE_THRESHOLD):
+      self.wheelpos_offsetter.push_and_update(rhd_pred)
+
+    wheelpos_calibrated = self.wheelpos_offsetter.filtered_stat.n >= self.settings._WHEELPOS_FILTER_MIN_COUNT
+
+    if wheelpos_calibrated or demo_mode:
+      self.wheel_on_right = self.wheelpos_offsetter.filtered_stat.M > self.settings._WHEELPOS_THRESHOLD
+    else:
+      self.wheel_on_right = self.wheel_on_right_default # use default/saved if calibration is unfinished
+    # make sure no switching when engaged
+    if op_engaged and self.wheel_on_right_last is not None and self.wheel_on_right_last != self.wheel_on_right and not demo_mode:
+      self.wheel_on_right = self.wheel_on_right_last
+    driver_data = driver_state.rightDriverData if self.wheel_on_right else driver_state.leftDriverData
+    if not all(len(x) > 0 for x in (driver_data.faceOrientation, driver_data.facePosition,
+                                    driver_data.faceOrientationStd, driver_data.facePositionStd)):
+      return
+
+    self.face_detected = driver_data.faceProb > self.settings._FACE_THRESHOLD
+    self.pose.pitch, self.pose.yaw = face_orientation_from_model(driver_data.faceOrientation, driver_data.facePosition, cal_rpy)
+    steer_d = max(abs(steering_angle_deg) - self.settings._POSE_YAW_MIN_STEER_DEG, 0.)
+    self.pose.steer_yaw_offset = radians(steer_d) * -np.sign(steering_angle_deg) * self.settings._POSE_YAW_STEER_FACTOR
+    if self.wheel_on_right:
+      self.pose.yaw *= -1
+      self.pose.steer_yaw_offset *= -1
+    self.wheel_on_right_last = self.wheel_on_right
+    self.model_std_max = max(driver_data.faceOrientationStd[0], driver_data.faceOrientationStd[1])
+    self.pose.low_std = self.model_std_max < self.settings._HI_STD_THRESHOLD
+    self.blink.left = driver_data.leftBlinkProb * (driver_data.leftEyeProb > self.settings._EYE_THRESHOLD) \
+                      * (driver_data.sunglassesProb < self.settings._SG_THRESHOLD)
+    self.blink.right = driver_data.rightBlinkProb * (driver_data.rightEyeProb > self.settings._EYE_THRESHOLD) \
+                      * (driver_data.sunglassesProb < self.settings._SG_THRESHOLD)
+    self.phone_prob = driver_data.phoneProb
+    self.sleep_prob = driver_data.sleepProb
+
+    self._get_distracted_types()
+    self.driver_distracted = any(self.distracted_types.values()) and driver_data.faceProb > self.settings._FACE_THRESHOLD and self.pose.low_std
+    self.driver_distraction_filter.update(self.driver_distracted)
+
+    # only update offsetter when driver is actively driving the car above a certain speed
+    if self.face_detected and car_speed > self.settings._POSE_CALIB_MIN_SPEED and self.pose.low_std and (not op_engaged or not self.driver_distracted):
+      self.pose.pitch_offsetter.push_and_update(self.pose.pitch)
+      self.pose.yaw_offsetter.push_and_update(self.pose.yaw)
+
+    self.pose.calibrated = self.pose.pitch_offsetter.filtered_stat.n >= self.settings._POSE_OFFSET_MIN_COUNT and \
+                           self.pose.yaw_offsetter.filtered_stat.n >= self.settings._POSE_OFFSET_MIN_COUNT
+
+    if self.face_detected and not self.driver_distracted:
+      dcam_uncertain = self.model_std_max > self.settings._DCAM_UNCERTAIN_ALERT_THRESHOLD
+      if dcam_uncertain and not lowspeed:
+        self.dcam_uncertain_cnt += 1
+        self.dcam_reset_cnt = 0
+      else:
+        self.dcam_reset_cnt += 1
+        if self.dcam_reset_cnt > self.settings._DCAM_UNCERTAIN_RESET_COUNT:
+          self.dcam_uncertain_cnt = 0
+
+    self.is_model_uncertain = self.hi_stds >= self.settings._HI_STD_FALLBACK_TIME
+    self._set_policy(MonitoringPolicy.vision if self.face_detected and not self.is_model_uncertain else MonitoringPolicy.wheeltouch)
+    if self.face_detected and not self.pose.low_std and not self.driver_distracted:
+      self.hi_stds += 1
+    elif self.face_detected and self.pose.low_std:
+      self.hi_stds = 0
+
+  def _update_events(self, driver_engaged, op_engaged, lowspeed, wrong_gear):
+    self.alert_level = AlertLevel.none
+    self.driver_interacting = driver_engaged
+
+    if self.alert_3_cnt >= self.settings._MAX_ALERT_3 or self.no_response_cnt >= self.settings._MAX_NO_RESPONSE:
+      if not self.lockout_active:
+        self.lockout_count += 1
+        self.lockout_duration = self.settings._LOCKOUT_TIMES[min(self.lockout_count - 1, len(self.settings._LOCKOUT_TIMES) - 1)]
+        Params().put("DriverLockoutCount", self.lockout_count)
+      self.lockout_active = True
+
+    if self.lockout_active:
+      self.lockout_time_elapsed += 1
+      if self.lockout_time_elapsed > self.lockout_duration:
+        self.lockout_active = False
+        self.alert_3_cnt = 0
+        self.cnt_since_alert_3 = 0
+        self.no_response_cnt = 0
+        self.lockout_time_elapsed = 0
+
+    always_on_valid = self.always_on and not wrong_gear
+    if (self.driver_interacting and self.awareness > 0 and self.active_policy == MonitoringPolicy.wheeltouch) or \
+       (not always_on_valid and not op_engaged) or \
+       (always_on_valid and not op_engaged and self.awareness <= 0):
+      # always reset on disengage with normal mode; disengage resets only on red if always on
+      self._reset_awareness()
+      return
+
+    awareness_prev = self.awareness
+    _reaching_alert_1 = self.awareness - self.step_change <= self.threshold_alert_1
+    _reaching_alert_3 = self.awareness - self.step_change <= 0
+    lowspeed_exemption = lowspeed and _reaching_alert_1
+    always_on_exemption = always_on_valid and not op_engaged and _reaching_alert_3
+
+    if self.awareness > 0 and \
+       ((self.driver_distraction_filter.x < 0.37 and self.face_detected and self.pose.low_std) or lowspeed_exemption):
+      if self.driver_interacting:
+        self._reset_awareness()
+        return
+      # only restore awareness when paying attention and alert is not red
+      self.awareness = min(self.awareness + ((self.settings._TIMEOUT_RECOVERY_FACTOR_MAX-self.settings._TIMEOUT_RECOVERY_FACTOR_MIN)*
+                                             (1.-self.awareness)+self.settings._TIMEOUT_RECOVERY_FACTOR_MIN)*self.step_change, 1.)
+      if self.awareness == 1.:
+        self.last_wheeltouch_awareness = min(self.last_wheeltouch_awareness + self.step_change, 1.)
+      # don't display alert banner when awareness is recovering and has cleared orange
+      if self.awareness > self.threshold_alert_2:
+        return
+
+    certainly_distracted = self.driver_distraction_filter.x > 0.63 and self.driver_distracted and self.face_detected
+    maybe_distracted = self.is_model_uncertain or not self.face_detected
+
+    if certainly_distracted or maybe_distracted:
+      # should always be counting if distracted unless at low speed and reaching green
+      # also will not be reaching 0 if DM is active when not engaged
+      if not (lowspeed_exemption or always_on_exemption):
+        self.awareness = max(self.awareness - self.step_change, -0.1)
+
+    if self.awareness <= 0.:
+      # terminal alert: disengagement required
+      self.alert_level = AlertLevel.three
+      if awareness_prev > 0.:
+        self.alert_3_cnt += 1
+        self.cnt_since_alert_3 = 0
+      else:
+        self.cnt_since_alert_3 += 1
+      if self.cnt_since_alert_3 == self.no_response_timeout:
+        self.no_response_cnt += 1
+    else:
+      if self.awareness <= self.threshold_alert_2:
+        self.alert_level = AlertLevel.two
+      elif self.awareness <= self.threshold_alert_1:
+        self.alert_level = AlertLevel.one
+
+  def get_state_packet(self, valid=True):
+    # build driverMonitoringState packet
+    dat = messaging.new_message('driverMonitoringState', valid=valid)
+    dm = dat.driverMonitoringState
+
+    dm.lockout = self.lockout_active
+    dm.lockoutCount = self.lockout_count
+    if self.lockout_active:
+      dm.lockoutMinutesRemaining = max(1, round((self.lockout_duration - self.lockout_time_elapsed) * DT_DMON / 60.))
+    dm.alert3Count = self.alert_3_cnt
+    dm.noResponseCount = self.no_response_cnt
+    dm.noResponseForceDecel = self.alert_level == AlertLevel.three and self.cnt_since_alert_3 >= self.no_response_timeout
+    dm.alwaysOn = self.always_on
+    dm.alwaysOnLockout = self.always_on and self.awareness <= self.threshold_alert_2
+    dm.alertLevel = self.alert_level
+    dm.activePolicy = self.active_policy
+    dm.isRHD = self.wheel_on_right
+    dm.rhdCalibration.calibratedPercent = to_percent(self.wheelpos_offsetter.filtered_stat.n / self.settings._WHEELPOS_FILTER_MIN_COUNT)
+    dm.rhdCalibration.offset = self.wheelpos_offsetter.filtered_stat.M
+
+    dm.visionPolicyState.awarenessPercent = to_percent(self.last_vision_awareness if self.active_policy != MonitoringPolicy.vision else self.awareness)
+    dm.visionPolicyState.awarenessStep = self.step_change if self.active_policy == MonitoringPolicy.vision else 0.
+    dm.visionPolicyState.isDistracted = self.driver_distracted
+    dm.visionPolicyState.distractedTypes.pose = self.distracted_types['pose']
+    dm.visionPolicyState.distractedTypes.eye = self.distracted_types['eye']
+    dm.visionPolicyState.distractedTypes.phone = self.distracted_types['phone']
+    dm.visionPolicyState.distractedTypes.sleep = self.distracted_types['sleep']
+    dm.visionPolicyState.faceDetected = self.face_detected
+    dm.visionPolicyState.pose.pitch = self.pose.pitch
+    dm.visionPolicyState.pose.yaw = self.pose.yaw
+    dm.visionPolicyState.pose.calibrated = self.pose.calibrated
+    dm.visionPolicyState.pose.pitchCalib.calibratedPercent = to_percent(self.pose.pitch_offsetter.filtered_stat.n / self.settings._POSE_OFFSET_MIN_COUNT)
+    dm.visionPolicyState.pose.pitchCalib.offset = self.pose.pitch_offsetter.filtered_stat.M
+    dm.visionPolicyState.pose.yawCalib.calibratedPercent = to_percent(self.pose.yaw_offsetter.filtered_stat.n / self.settings._POSE_OFFSET_MIN_COUNT)
+    dm.visionPolicyState.pose.yawCalib.offset = self.pose.yaw_offsetter.filtered_stat.M
+    dm.visionPolicyState.pose.uncertainty = self.model_std_max
+    dm.visionPolicyState.wheeltouchFallbackPercent = to_percent(self.hi_stds / self.settings._HI_STD_FALLBACK_TIME)
+    dm.visionPolicyState.uncertainOffroadAlertPercent = to_percent(self.dcam_uncertain_cnt / self.settings._DCAM_UNCERTAIN_ALERT_COUNT)
+
+    dm.wheeltouchPolicyState.awarenessPercent = to_percent(self.last_wheeltouch_awareness if self.active_policy == MonitoringPolicy.vision else self.awareness)
+    dm.wheeltouchPolicyState.awarenessStep = 0. if self.active_policy == MonitoringPolicy.vision else self.step_change
+    dm.wheeltouchPolicyState.driverInteracting = self.driver_interacting
+    return dat
+
+  def run_step(self, sm, demo=False):
+    if demo:
+      car_speed = 30
+      enabled = True
+      wrong_gear = False
+      lowspeed = False
+      driver_engaged = False
+      brake_disengage_prob = 1.0
+      steering_angle_deg = 0.0
+      rpyCalib = [0., 0., 0.]
+    else:
+      car_speed = sm['carState'].vEgo
+      enabled = sm['selfdriveState'].enabled or sm['carControl'].latActive
+      wrong_gear = sm['carState'].gearShifter not in (car.CarState.GearShifter.drive, car.CarState.GearShifter.low)
+      lowspeed = car_speed < self.settings._ALERT_MIN_SPEED
+      driver_engaged = sm['carState'].steeringPressed or (sm['selfdriveState'].enabled and sm['carState'].gasPressed)
+      brake_disengage_prob = sm['modelV2'].meta.disengagePredictions.brakeDisengageProbs[0] # brake disengage prob in next 2s
+      steering_angle_deg = sm['carState'].steeringAngleDeg
+      rpyCalib = sm['extrinsicsCalibration'].rpyCalib
+
+    self._set_pose_strictness(
+      brake_disengage_prob=brake_disengage_prob,
+      car_speed=car_speed,
+    )
+
+    # Parse data from dmonitoringmodeld
+    self._update_states(
+      driver_state=sm['driverStateV2'],
+      cal_rpy=rpyCalib,
+      car_speed=car_speed,
+      op_engaged=enabled,
+      lowspeed=lowspeed,
+      demo_mode=demo,
+      steering_angle_deg=steering_angle_deg,
+    )
+
+    # Update distraction events
+    self._update_events(
+      driver_engaged=driver_engaged,
+      op_engaged=enabled,
+      lowspeed=lowspeed,
+      wrong_gear=wrong_gear,
+    )
